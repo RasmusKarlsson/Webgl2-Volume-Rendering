@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Volume Rendering using 3D Texture by Rasmus Karlsson</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0">
+    <link rel="stylesheet" href="style.css">
+    <script src="libs/utility.js"></script>
+    <script src="libs/gl-matrix-min.js"></script>
+    <script src="libs/tiff.min.js"></script>
+    <script src="libs/dat.gui.min.js"></script>
+</head>
+
+<body>
+    <div id="info">Volume Rendering using 3D Texture by Rasmus Karlsson</div>
+    <p id="description">
+
+    </p>
+
+    <script id="vs" type="x-shader/x-vertex">
+        #version 300 es
+        #define POSITION_LOCATION 0
+        #define TEXCOORD_LOCATION 1
+
+        precision highp float;
+        precision highp int;
+
+        layout(location = POSITION_LOCATION) in vec2 position;
+        layout(location = TEXCOORD_LOCATION) in vec2 in_texcoord;
+
+        // Output 3D texture coordinate after transformation
+        out vec3 v_texcoord;
+        out vec3 v_cross;
+        // Matrix to transform the texture coordinates into 3D space
+        uniform mat4 u_orientation;
+        uniform float u_time;
+        uniform float u_aspect;
+        uniform float u_zoom;
+
+        void main()
+        {
+            // Multiply the texture coordinate by the transformation
+            // matrix to place it into 3D space
+            vec2 texCoord = in_texcoord;
+            v_texcoord = (u_orientation * 4.0*vec4(texCoord - vec2(0.5, 0.5), 0.0, 0.0)).xyz;
+            vec3 dx = (u_orientation * 2.0*vec4(texCoord+vec2(0.001,0.0) - vec2(0.5, 0.5), 0.0, 0.0)).xyz;
+            vec3 dy = (u_orientation * 2.0*vec4(texCoord+vec2(0.0,0.001) - vec2(0.5, 0.5), 0.0, 0.0)).xyz;
+            v_cross = normalize(cross(dx,dy));
+            gl_Position = vec4(position*vec2(1.0+u_zoom), 0.0, 1.0);
+            gl_Position.x /= u_aspect;
+        }
+
+    </script>
+
+    <script id="fs" type="x-shader/x-fragment">
+        #version 300 es
+
+        precision highp float;
+        precision highp int;
+        precision highp sampler3D;
+
+        uniform sampler3D u_diffuse;
+        uniform sampler2D u_transfer;
+        uniform float u_time;
+        uniform int u_low;
+        uniform int u_high;
+        uniform float u_breakValue;
+
+        in vec3 v_texcoord;
+        in vec3 v_cross;
+
+        out vec4 color;
+
+        mat4 rotationMatrix(vec3 axis, float angle)
+        {
+            axis = normalize(axis);
+            float s = sin(angle);
+            float c = cos(angle);
+            float oc = 1.0 - c;
+
+            return mat4(oc * axis.x * axis.x + c,           oc * axis.x * axis.y - axis.z * s,  oc * axis.z * axis.x + axis.y * s,  0.0,
+                        oc * axis.x * axis.y + axis.z * s,  oc * axis.y * axis.y + c,           oc * axis.y * axis.z - axis.x * s,  0.0,
+                        oc * axis.z * axis.x - axis.y * s,  oc * axis.y * axis.z + axis.x * s,  oc * axis.z * axis.z + c,           0.0,
+                        0.0,                                0.0,                                0.0,                                1.0);
+        }
+
+        bool validateUVW(vec3 uv)
+        {
+            if(uv.x > 0.0 && uv.y > 0.0 && uv.z > 0.0 && uv.x < 1.0 && uv.y < 1.0 && uv.z < 1.0) return true;
+            return false;
+        }
+
+        void main()
+        {
+            vec3 frag = vec3(0.0);
+
+            vec3 texCoord = 0.5*v_texcoord*vec3(1,1,2);
+            //frag = texture(diffuse, rotateVector.rgb+0.5).rgb;
+
+            //frag = texture(diffuse, texCoord.rgb+vec3(0.5,0.5,0.5)).rgb;
+            const int samples = 256;
+            const float fInvSamples = 1.0/float(samples);
+            float usedSamples = 1.0;
+            float hi = 0.0;
+            float low = 0.0;
+            float dist = 0.0;
+            for(int i = -samples;i<samples;i++)
+            {
+                vec3 tc = texCoord.rgb+0.5*float(i)*fInvSamples*v_cross+vec3(0.5,0.5,0.5);
+                //vec3 tc = texCoord.rgb+v_cross+vec3(0.5,0.5,0.5);
+                float color = texture(u_diffuse, tc).r;
+                int isoValue = int(255.0*color);
+                if(validateUVW(tc) && tc.z < 0.98)
+                {
+
+                  //frag += color*fInvSamples;
+                  //if(isoValue > 40 && isoValue < 62)
+                    //frag.r += color*fInvSamples;
+                  if(isoValue > u_low && isoValue < u_high)
+                  {
+                      hi += color;
+                      usedSamples+=1.0;
+                      dist = float(i);
+                      frag += color*texture(u_transfer, vec2(color,0.5)).rgb;
+                      if(hi > u_breakValue)
+                      {
+                        hi = u_breakValue;
+                        break;
+                      }
+                  }
+                }
+            }
+
+
+            color = vec4(frag*fInvSamples,1.0);
+          //  color = vec4(1.0);
+          //  color += vec4(vec3(0.5*fInvSamples*dist),1.0);
+          //  color = vec4(vec3(frag.b),1.0);
+        }
+    </script>
+
+    <script>
+    (function() {
+        'use strict';
+
+        var canvas = document.createElement('canvas');
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        document.body.appendChild(canvas);
+
+        var gl = canvas.getContext( 'webgl2', { antialias: false } );
+        var isWebGL2 = !!gl;
+        if(!isWebGL2) {
+            document.getElementById('info').innerHTML = 'WebGL 2 is not available.  See <a href="https://www.khronos.org/webgl/wiki/Getting_a_WebGL_Implementation">How to get a WebGL 2 implementation</a>';
+            return;
+        }
+
+        // -- Divide viewport
+
+        var windowSize = {
+            x: canvas.width,
+            y: canvas.height
+        };
+
+        var maskLowController;
+        var maskHighController;
+        var maskBreakController;
+        var maskLowValue = 58.0;
+        var maskHighValue = 255;
+        var maskBreakValue = 250;
+
+        //Dat Gui
+        var VolumeRenderGUI = function() {
+          this.MaskLow = 58.0;
+          this.MaskHigh = 255.0;
+          this.MaskBreak = 250.0;
+        //  this.displayOutline = false;
+        //  this.explode = function() { ... };
+          // Define render logic ...
+        };
+        window.onload = function() {
+          var text = new VolumeRenderGUI();
+          var gui = new dat.GUI();
+          maskLowController = gui.add(text, 'MaskLow', 0, 255);
+          maskHighController = gui.add(text, 'MaskHigh', 0, 255);
+          maskBreakController = gui.add(text, 'MaskBreak', 0, 255);
+      //    gui.add(text, 'explode');
+          maskLowController.onChange(function(value) {
+            maskLowValue = value;
+          });
+          maskHighController.onChange(function(value) {
+            maskHighValue = value;
+          });
+          maskBreakController.onChange(function(value) {
+            maskBreakValue = value;
+          });
+        };
+
+        gl.activeTexture(gl.TEXTURE1);
+        var transferFunctionTexture = loadTexture(gl,"assets/transferfunction.png");
+
+
+
+
+        // -- Initialize texture
+
+        // Note By @kenrussel: The sample was changed from R32F to R8 for best portability.
+        // not all devices can render to floating-point textures
+        // (and, further, this functionality is in a WebGL extension: EXT_color_buffer_float),
+        // and renderability is a requirement for generating mipmaps.
+
+        String.prototype.lpad = function(padString, length) {
+            var str = this;
+            while (str.length < length)
+                str = padString + str;
+            return str;
+        }
+
+        //var dataScan = new Uint8Array(3 * 512 * 512 * 234);
+        var sliceData = new Uint8Array(3 * 512 * 512 * 1);
+        var WIDTH = 512;
+        var HEIGHT = 512;
+        var DEPTH = 234;
+        var c = 1;
+        var xhr = new XMLHttpRequest();
+        var number = ""+c;
+
+        xhr.responseType = 'arraybuffer';
+      //  xhr.open('GET', "assets/mrbrain-8bit/mrbrain-8bit"+number.lpad("0",3)+".tif");
+      //  xhr.open('GET', "assets/cthead/cthead-8bit"+number.lpad("0",3)+".tif");
+        //  xhr.open('GET', "assets/HeadJpg/femHead"+number.lpad("0",3)+".jpg");
+
+        var histogram = [];
+        for(var i = 0; i < 256;i++)
+        {
+            histogram[i] = 0;
+        }
+
+        var dz = 0;
+        var image = new Image();
+        image.onload = function(){
+          var canvas = document.createElement('canvas');
+          canvas.width = 512;
+          canvas.height = 512;
+          var ctx = canvas.getContext('2d');
+          ctx.drawImage(image,0,0);
+          var pixelData = ctx.getImageData(0, 0, 512, 512).data;
+
+          var z = dz;
+          for(var x = 0; x < 512;x++)
+          {
+              for(var y = 0; y < 512; y++)
+              {
+                  sliceData[1*(y + WIDTH * (x + HEIGHT * 0))+0] = pixelData[4*(x*WIDTH+y)+0];
+                  var val = sliceData[1*(y + WIDTH * (x + HEIGHT * 0))+0];
+                  histogram[val] = histogram[val]+1;
+                //  sliceData[3*(y + WIDTH * (x + HEIGHT * 0))+1] = pixelData[4*(x*WIDTH+y)+1];
+                //  sliceData[3*(y + WIDTH * (x + HEIGHT * 0))+2] = pixelData[4*(x*WIDTH+y)+2];
+              }
+          }
+        //  console.log("Loading Slice "+z);
+          gl.bindTexture(gl.TEXTURE_3D, texture);
+          gl.texSubImage3D(	gl.TEXTURE_3D,  // target
+           	0,
+           	0,
+           	0,
+           	z,
+           	512,
+           	512,
+           	1,
+            gl.RED,         // format
+            gl.UNSIGNED_BYTE,       // type
+            sliceData);            // pixel
+
+            dz++;
+          number = ""+c;
+          if(c < 234)
+          {
+              c++;
+            //  xhr.open('GET', "assets/mrbrain-8bit/mrbrain-8bit"+number.lpad("0",3)+".tif");
+              //xhr.open('GET', "assets/HeadJpg/femHead"+number.lpad("0",3)+".jpg");
+              image.src = "assets/HeadJpg/femHead"+number.lpad("0",3)+".jpg";
+              //xhr.send();
+          }
+          else {
+              gl.generateMipmap(gl.TEXTURE_3D);
+              gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR );
+              gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+/*
+              var histogramCanvas = document.createElement('canvas');
+              histogramCanvas.style.paddingTop = "-256";
+              histogramCanvas.width = 512;
+              histogramCanvas.height = 256;
+              var ctx = histogramCanvas.getContext('2d');
+
+              ctx.beginPath();
+              ctx.lineWidth = "1";
+              ctx.strokeStyle = "red";
+              for(var i = 0; i < 256;i++)
+              {
+                ctx.rect(2*i, 0, 1, histogram[i]*0.01);
+              }
+              ctx.stroke();
+
+              document.body.appendChild(histogramCanvas);
+*/
+          }
+
+        };
+        image.src = "assets/HeadJpg/femHead"+number.lpad("0",3)+".jpg";
+
+        var SIZE = 512;
+        var data = new Uint8Array(1 * SIZE * SIZE * 234);
+
+        var texture = gl.createTexture();
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_3D, texture);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_BASE_LEVEL, 0);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAX_LEVEL, Math.log2(SIZE));
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST );
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+
+
+
+        gl.texImage3D(
+            gl.TEXTURE_3D,  // target
+            0,              // level
+            gl.R8,        // internalformat
+            SIZE,           // width
+            SIZE,           // height
+            234,           // depth
+            0,              // border
+            gl.RED,         // format
+            gl.UNSIGNED_BYTE,       // type
+            data            // pixel
+            );
+
+        gl.generateMipmap(gl.TEXTURE_3D);
+
+        // -- Initialize program
+        var program = createProgram(gl, getShaderSource('vs'), getShaderSource('fs'));
+
+        var uniformTextureMatrixLocation = gl.getUniformLocation(program, 'u_orientation');
+        var uniformDiffuseLocation = gl.getUniformLocation(program, 'u_diffuse');
+        var uniformTransferLocation = gl.getUniformLocation(program, 'u_transfer');
+        var uniformTimeLocation = gl.getUniformLocation(program, 'u_time');
+        var uniformWheelLocation = gl.getUniformLocation(program, 'u_zoom');
+        var uniformAspectLocation = gl.getUniformLocation(program, 'u_aspect');
+        var uniformLowLocation = gl.getUniformLocation(program, 'u_low');
+        var uniformHighLocation = gl.getUniformLocation(program, 'u_high');
+        var uniformBreakLocation = gl.getUniformLocation(program, 'u_breakValue');
+
+        // -- Initialize buffer
+        var positions = new Float32Array([
+            -1.0, -1.0,
+             1.0, -1.0,
+             1.0,  1.0,
+             1.0,  1.0,
+            -1.0,  1.0,
+            -1.0, -1.0
+        ]);
+        var vertexPosBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexPosBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+        var texCoords = new Float32Array([
+            0.0, 1.0,
+            1.0, 1.0,
+            1.0, 0.0,
+            1.0, 0.0,
+            0.0, 0.0,
+            0.0, 1.0
+        ]);
+        var vertexTexBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexTexBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, texCoords, gl.STATIC_DRAW);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+        // -- Initilize vertex array
+
+        var vertexArray = gl.createVertexArray();
+        gl.bindVertexArray(vertexArray);
+
+        var vertexPosLocation = 0; // set with GLSL layout qualifier
+        gl.enableVertexAttribArray(vertexPosLocation);
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexPosBuffer);
+        gl.vertexAttribPointer(vertexPosLocation, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+        var vertexTexLocation = 1; // set with GLSL layout qualifier
+        gl.enableVertexAttribArray(vertexTexLocation);
+        gl.bindBuffer(gl.ARRAY_BUFFER, vertexTexBuffer);
+        gl.vertexAttribPointer(vertexTexLocation, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+
+        gl.bindVertexArray(null);
+
+        // -- Render
+
+        var orientation = [0.0, 0.0, 0.0];
+
+        requestAnimationFrame(render);
+
+        var rotMatrix = new mat4.create();
+        var rotMatrix2 = new mat4.create();
+        var rotMatrix3 = new mat4.create();
+/*
+        function makeRotationDir(direction)
+        {
+            Vec3 xaxis = Vec3::Cross(up, direction);
+            xaxis.normalizeFast();
+
+            Vec3 yaxis = Vec3::Cross(direction, xaxis);
+            yaxis.normalizeFast();
+
+            column1.x = xaxis.x;
+            column1.y = yaxis.x;
+            column1.z = direction.x;
+
+            column2.x = xaxis.y;
+            column2.y = yaxis.y;
+            column2.z = direction.y;
+
+            column3.x = xaxis.z;
+            column3.y = yaxis.z;
+            column3.z = direction.z;
+        }
+*/
+        var wheely = 1.0;
+        var mousex = 0.0;
+        var mousey = 0.0;
+        var lastx = 0.0;
+        var lasty = 0.0;
+
+        (function() {
+            document.onmousemove = handleMouseMove;
+            function handleMouseMove(event) {
+                var dot, eventDoc, doc, body, pageX, pageY;
+                event = event || window.event; // IE-ism
+                if(event.target != canvas) return;
+                // If pageX/Y aren't available and clientX/Y are,
+                // calculate pageX/Y - logic taken from jQuery.
+                // (This is to support old IE)
+                if (event.pageX == null && event.clientX != null) {
+                    eventDoc = (event.target && event.target.ownerDocument) || document;
+                    doc = eventDoc.documentElement;
+                    body = eventDoc.body;
+
+                    event.pageX = event.clientX +
+                      (doc && doc.scrollLeft || body && body.scrollLeft || 0) -
+                      (doc && doc.clientLeft || body && body.clientLeft || 0);
+                    event.pageY = event.clientY +
+                      (doc && doc.scrollTop  || body && body.scrollTop  || 0) -
+                      (doc && doc.clientTop  || body && body.clientTop  || 0 );
+                }
+                if(event.buttons)
+                {
+                    mousex += lastx-event.pageX;
+                    mousey += lasty-event.pageY;
+                    //mat4.fromXRotation(rotMatrix2,-Math.PI/2.0);
+                  //  mat4.mul(rotMatrix,rotMatrix,rotMatrix2);
+                    mat4.fromYRotation(rotMatrix3,-0.01*mousex);
+                    mat4.fromXRotation(rotMatrix2,0.01*mousey-Math.PI/2.0);
+                    mat4.mul(rotMatrix2,rotMatrix2,rotMatrix3);
+                //  mat4.mul(rotMatrix,rotMatrix,rotMatrix2);
+                }
+
+                lastx = event.pageX;
+                lasty = event.pageY;
+                // Use event.pageX / event.pageY here
+            }
+            window.addEventListener('wheel', mouseWheelEvent);
+
+            function mouseWheelEvent(e) {
+                wheely -= 0.001*e.deltaY;
+                if(wheely < -0.99)
+                  wheely = -0.99;
+            }
+        })();
+
+        mat4.fromXRotation(rotMatrix2,-Math.PI/2.0);
+        mat4.mul(rotMatrix,rotMatrix,rotMatrix2);
+
+        var startTime = new Date();
+
+
+
+        function render() {
+            // Clear color buffer
+            gl.clearColor(0.0, 0.0, 0.0, 1.0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+
+            // Bind program
+            gl.useProgram(program);
+
+            gl.uniform1i(uniformDiffuseLocation, 0);
+            gl.uniform1i(uniformTransferLocation, 1);
+            var newTime = new Date();
+            var timems = (newTime-startTime)/1000;
+            gl.uniform1f(uniformTimeLocation, timems);
+
+            gl.uniform1f(uniformWheelLocation, wheely);
+
+            gl.uniform1f(uniformAspectLocation, windowSize.x/windowSize.y);
+
+            gl.uniform1i(uniformLowLocation, maskLowValue);
+            gl.uniform1i(uniformHighLocation, maskHighValue);
+            gl.uniform1f(uniformBreakLocation, maskBreakValue);
+
+
+
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_3D, texture);
+
+            gl.activeTexture(gl.TEXTURE1);
+            gl.bindTexture(gl.TEXTURE_2D, transferFunctionTexture);
+
+
+            gl.bindVertexArray(vertexArray);
+
+            gl.viewport(0,0,windowSize.x,windowSize.y);
+            mat4.identity(rotMatrix);
+            mat4.mul(rotMatrix,rotMatrix,rotMatrix2);
+            gl.uniformMatrix4fv(uniformTextureMatrixLocation, false, rotMatrix);
+            gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, 1);
+
+
+            requestAnimationFrame(render);
+        }
+    })();
+    </script>
+
+</body>
+
+</html>
